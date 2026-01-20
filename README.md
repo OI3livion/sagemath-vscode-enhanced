@@ -29,6 +29,21 @@ Enhance your SageMath coding experience in Visual Studio Code with the SageMath 
 
 ## Features
 
+> [!NOTE]
+> **🚀 Next Generation in Testing**
+> We are currently flighting the next major update! Help us shape the future by testing the latest features and reporting bugs.
+
+<table style="width: 100%; border-collapse: collapse;">
+  <tr>
+    <td style="width: 50%; border: none;">
+      <img src="https://github.com/user-attachments/assets/55fa74fe-1ad6-434d-b157-fef4906d4539" alt="截屏1" style="width: 100%;">
+    </td>
+    <td style="width: 50%; border: none;">
+      <img src="https://github.com/user-attachments/assets/ac870426-7bbd-4392-adc2-b781028adaa9" alt="截屏2" style="width: 100%;">
+    </td>
+  </tr>
+</table>
+
 - **Language Server Protocol (LSP) Support**: Complete LSP implementation providing advanced language features
 - **Intelligent Code Completion**: Context-aware autocompletion for SageMath functions, classes, and methods
 - **Hover Documentation**: Instant documentation and type information on hover
