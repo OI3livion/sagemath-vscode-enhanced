@@ -112,6 +112,7 @@ class LSPClient {
                         maxNumberOfProblems: 100,
                         enableDiagnostics: true,
                         enableCompletion: true,
+                        enableHover: true,
                         sagePath: 'sage'
                     }]
                 });
