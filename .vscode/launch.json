@@ -1,0 +1,49 @@
+{
+	"version": "0.2.0",
+	"configurations": [
+		{
+			// Launches a second VS Code window (Extension Development Host) with
+			// this extension loaded from its compiled output. Press F5 to start.
+			"name": "Run Extension (Development Host)",
+			"type": "extensionHost",
+			"request": "launch",
+			"args": [
+				"--extensionDevelopmentPath=${workspaceFolder}"
+			],
+			"outFiles": [
+				"${workspaceFolder}/out/**/*.js"
+			],
+			"preLaunchTask": "npm: compile"
+		},
+		{
+			// Runs the extension test suite inside an Extension Development Host.
+			// Mirrors `npm test` (vscode-test) but lets you set breakpoints.
+			"name": "Extension Tests",
+			"type": "extensionHost",
+			"request": "launch",
+			"runtimeExecutable": "${execPath}",
+			"args": [
+				"--extensionDevelopmentPath=${workspaceFolder}",
+				"--extensionTestsPath=${workspaceFolder}/out/src/test"
+			],
+			"outFiles": [
+				"${workspaceFolder}/out/**/*.js"
+			],
+			"preLaunchTask": "npm: compile"
+		},
+		{
+			// Attaches a Node debugger to the language server child process so you
+			// can set breakpoints in server/src/server.ts. See
+			// docs/TESTING_AND_DEBUGGING.md -> "Debugging the language server".
+			"name": "Attach to Language Server",
+			"type": "node",
+			"request": "attach",
+			"port": 6009,
+			"restart": true,
+			"sourceMaps": true,
+			"outFiles": [
+				"${workspaceFolder}/out/**/*.js"
+			]
+		}
+	]
+}
