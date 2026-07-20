@@ -299,4 +299,49 @@ export function bundledMethodDoc(name: string): SymbolDoc | undefined {
 	return s ? { summary: s, source: 'bundled' } : undefined;
 }
 
+/**
+ * Build a SymbolDoc from a position-based hover analysis result
+ * (`{name, doc, signature, source}`). The doc is raw reST; it is converted to
+ * Markdown, with the EXAMPLES block split out into `example`.
+ */
+export function docFromHoverResult(name: string, result: { doc?: string; signature?: string; source?: string }): SymbolDoc | undefined {
+	if (!result || !result.doc) {
+		return undefined;
+	}
+	const body = rstToMarkdown(result.doc);
+	// Split out an EXAMPLES block into a dedicated `example`.
+	let description = body;
+	let example: string | undefined;
+	const exIdx = body.indexOf('**Examples**');
+	if (exIdx >= 0) {
+		const after = body.slice(exIdx);
+		description = body.slice(0, exIdx).trimEnd();
+		const fence = after.match(/```sage\n([\s\S]*?)```/);
+		if (fence) {
+			example = fence[1].trim();
+		}
+	}
+	const lines = description.split('\n').map(l => l.trimEnd()).filter((l, idx, arr) =>
+		!(l.trim() === '' && (idx === 0 || idx === arr.length - 1)));
+	const firstNonBlank = lines.findIndex(l => l.trim() !== '');
+	let summary = '';
+	let desc: string | undefined;
+	if (firstNonBlank >= 0) {
+		summary = lines[firstNonBlank].trim();
+		if (lines.length > firstNonBlank + 1) {
+			const rest = lines.slice(firstNonBlank + 1).join('\n').trim();
+			if (rest) {
+				desc = rest;
+			}
+		}
+	}
+	return {
+		signature: result.signature || undefined,
+		summary: summary || name,
+		description: desc,
+		example,
+		source: (result.source as SymbolDoc['source']) || 'sage'
+	};
+}
+
 

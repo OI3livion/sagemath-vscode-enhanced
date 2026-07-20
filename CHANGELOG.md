@@ -9,47 +9,44 @@ Check [Keep a Changelog](http://keepachangelog.com/) for recommendations on how 
 ### Added - Live SageMath documentation & signature help
 
 - **Live documentation from the SageMath runtime**: hover and completion now
-  show real docstrings and signatures pulled from the user's installed SageMath
-  via `sage.misc.sageinspect` (a background `sage` process, started lazily and
-  cached). Documentation is therefore always correct for the installed Sage
-  version, including user-installed packages.
+  show real docstrings and signatures from the user's installed SageMath. The
+  daemon now uses **Jedi (static analysis) as the primary engine**, with a safe
+  `getattr`-on-`sage.all` fallback for Cython symbols Jedi cannot read (e.g.
+  `ZZ`, `QQ`, `matrix`). **No `eval`, no allowlist** — editor text is parsed,
+  never executed.
 - **Signature help (parameter hints)**: typing inside a call (e.g.
-  `PolynomialRing(`) now shows a parameter popup with the active parameter
-  highlighted as you type commas.
-- **Richer hover cards**: hover now renders the full signature, a parameter
-  table, and code examples (converted from reST to Markdown).
-- **Signatures in the completion list**: the `detail` column shows each
-  function's argument list.
-- **Graceful fallback**: when SageMath is not installed or unavailable, the
-  extension falls back to the bundled one-line documentation, so hover and
-  completion keep working.
+  `PolynomialRing(`) shows a parameter popup via Jedi's `get_signatures`, with
+  the active parameter highlighted.
+- **Completion no longer competes inside calls**: when the cursor is inside `()`
+  on a line, the general SageMath function list is withheld and the callee's
+  **keyword arguments** are offered instead (e.g. `plot(` → `funcs`, `xrange`,
+  `parametric`, `polar`, …), with already-used kwargs deduplicated.
+- **Dotted completion**: typing `obj.` now offers the object's real attributes
+  and methods via Jedi (e.g. `MS.` on a `MatrixSpace` returns `base_ring`,
+  `nrows`, `characteristic`, …). Falls back to the static common-method list
+  when Jedi cannot infer the receiver type (Cython singletons/constructors).
+- **Broader general completion**: the general list now merges Jedi results with
+  the prioritized static list, so names not in the hardcoded list (e.g.
+  `MatrixSpace`) now appear while `PolynomialRing` stays #1 for `Poly`.
+- **Richer hover cards**: full signature, parameter table, and code examples
+  (reST converted to Markdown).
+- **Graceful fallback**: when SageMath/Jedi is unavailable, hover/completion
+  fall back to the bundled one-line documentation.
+- **Robust daemon launch**: tries `sage -python`, `sage --python`, the
+  configured `sagePythonPath`, `python`, `python3` in order, remembering the one
+  that works (fixes conda/micromamba installs where `sage -python` is absent).
 - **New settings**: `sagemathEnhanced.enableSageDocs`,
-  `sagemathEnhanced.hoverVerbosity` (`short` | `full`),
-  `sagemathEnhanced.hoverShowExamples`.
-- **Bugfix**: aligned the language server's interpreter setting with the
-  client's `sagemathEnhanced.interpreterPath` (previously the server read a
-  non-existent `sagePath` key and only worked by accident).
-- **Robust daemon launch**: the documentation daemon is now launched via
-  multiple methods tried in order (`sage -python`, `sage --python`, the
-  configured `sagePythonPath`, `python`, `python3`), auto-detecting whichever
-  reports a successful sage import and remembering it. This fixes environments
-  where `sage -python` is unavailable (e.g. conda/micromamba installs), which
-  previously caused hover/completion to silently fall back to the bundled docs
-  after a "Loading..." delay.
-- **Snappier completion**: completion item resolution no longer blocks on sage
-  startup (it renders from cache/bundled instantly and warms the cache in the
-  background once sage is ready). The daemon is also pre-warmed on the first
-  document activity so the first hover isn't slow.
-- **New settings**: `sagemathEnhanced.sagePythonPath`,
-  `sagemathEnhanced.sageDocLaunchMethod`.
+  `sagemathEnhanced.hoverVerbosity`, `sagemathEnhanced.hoverShowExamples`,
+  `sagemathEnhanced.sagePythonPath`, `sagemathEnhanced.sageDocLaunchMethod`.
 
 ### Changed
 
-- Extracted documentation content and rendering out of `server.ts` into
-  dedicated modules (`symbolDocs.ts`, `rstToMarkdown.ts`, `sageBackend.ts`,
-  `signatureHelp.ts`).
-- Fixed the `vscode-test` glob in `.vscode-test.mjs` so `npm test` actually
-  discovers the compiled tests.
+- `server/sage_doc_daemon.py` rewritten from an `eval`+allowlist design to a
+  Jedi + safe-getattr design (no arbitrary code execution from editor content).
+- Extracted documentation rendering into `symbolDocs.ts`, `rstToMarkdown.ts`,
+  `sageBackend.ts`, `signatureHelp.ts`.
+- Fixed the `vscode-test` glob in `.vscode-test.mjs` so `npm test` discovers
+  the compiled tests.
 
 ## [2.0.0] - 2024-01-XX
 

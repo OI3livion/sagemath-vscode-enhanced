@@ -32,6 +32,14 @@ export interface SageDocResult {
 	callable?: boolean;
 	error?: string;
 	startup_error?: string;
+	// Position-based (hover/signatures/complete) result fields:
+	name?: string;
+	signature?: string;
+	kind?: string;
+	source?: string;
+	empty?: boolean;
+	signatures?: Array<{ label: string; params: Array<{ name: string; default: string }>; active_parameter: number }>;
+	items?: Array<{ label: string; kind: string; detail: string; doc: string; complete?: string }>;
 }
 
 interface Pending {
@@ -144,6 +152,44 @@ export class SageBackend {
 		return this.lookupUncached(name, timeoutMs);
 	}
 
+	/**
+	 * Position-based analysis (hover/signatures/complete). NOT cached -- the
+	 * result depends on document text + cursor, which change constantly.
+	 * Returns an error result when the backend is unavailable so callers can
+	 * fall back.
+	 */
+	analyze(op: 'hover' | 'signatures' | 'complete', text: string, line: number, col: number, timeoutMs = 15000): Promise<SageDocResult> {
+		return this.analyzeUncached(op, text, line, col, timeoutMs);
+	}
+
+	private async analyzeUncached(op: string, text: string, line: number, col: number, timeoutMs: number): Promise<SageDocResult> {
+		if (!this.enabled) {
+			return { error: 'sage backend disabled' };
+		}
+		if (this.state !== 'ready') {
+			await this.start();
+		}
+		if (this.state !== 'ready' || !this.proc || !this.proc.stdin) {
+			return { error: this.startupError ?? 'sage backend not ready' };
+		}
+		return new Promise<SageDocResult>((resolve) => {
+			const id = this.nextId++;
+			const settle = (r: SageDocResult) => resolve(r);
+			const timer = setTimeout(() => {
+				this.pending.delete(id);
+				settle({ error: 'timeout' });
+			}, timeoutMs);
+			this.pending.set(id, { resolve: settle, timer });
+			try {
+				this.proc!.stdin!.write(JSON.stringify({ id, op, text, line, col }) + '\n');
+			} catch (err) {
+				clearTimeout(timer);
+				this.pending.delete(id);
+				settle({ error: `write failed: ${(err as Error).message}` });
+			}
+		});
+	}
+
 	private async lookupUncached(name: string, timeoutMs: number): Promise<SageDocResult> {
 		if (!this.enabled) {
 			const r: SageDocResult = { error: 'sage backend disabled' };
@@ -172,7 +218,7 @@ export class SageBackend {
 			this.pending.set(id, { resolve: settle, timer });
 
 			try {
-				this.proc!.stdin!.write(JSON.stringify({ id, name }) + '\n');
+				this.proc!.stdin!.write(JSON.stringify({ id, op: 'lookup', name }) + '\n');
 			} catch (err) {
 				clearTimeout(timer);
 				this.pending.delete(id);

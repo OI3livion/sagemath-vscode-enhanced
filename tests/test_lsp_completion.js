@@ -301,12 +301,15 @@ P
 
         console.log('\n🧪 Testing completion scenarios...\n');
 
-        // Test cases with expected positions
+        // Test cases with expected positions.
+        // `expectSuppressed: true` means the cursor is inside a function call on
+        // that line, so the general SageMath completion list should be withheld
+        // (signature help owns that context). PolynomialRing must NOT appear.
         const testCases = [
             { name: 'Poly', line: 2, character: 4, input: 'Poly' },
             { name: 'PolRin', line: 4, character: 10, input: 'PolRin' },
             { name: 'polR', line: 6, character: 4, input: 'polR' },
-            { name: 'Polyno', line: 8, character: 18, input: 'Polyno' },
+            { name: 'Polyno', line: 8, character: 18, input: 'Polyno', expectSuppressed: true },
             { name: 'P', line: 10, character: 1, input: 'P' }
         ];
 
@@ -326,6 +329,19 @@ P
                     item.insertText === 'PolynomialRing'
                 );
                 
+                if (testCase.expectSuppressed) {
+                    // Inside a call: the general list must be withheld.
+                    if (completions.length === 0) {
+                        console.log('   ✅ General completion correctly suppressed inside a call (signature help owns this context)');
+                    } else if (polynomialRingItem) {
+                        console.log('   ❌ General completion leaked inside a call (PolynomialRing present)');
+                        allTestsPassed = false;
+                    } else {
+                        console.log(`   ✅ Inside a call; ${completions.length} non-general items only`);
+                    }
+                    continue;
+                }
+
                 if (polynomialRingItem) {
                     console.log(`   ✅ PolynomialRing found at position ${completions.indexOf(polynomialRingItem) + 1}`);
                     console.log(`      Sort text: "${polynomialRingItem.sortText}"`);

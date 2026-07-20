@@ -33,12 +33,14 @@ import {
 	SymbolDoc,
 	RenderOptions,
 	docFromSage,
+	docFromHoverResult,
 	renderHoverMarkdown,
 	renderCompletionMarkdown,
 	bundledBuiltinDoc,
 	bundledMethodDoc
 } from './symbolDocs.js';
 import { getCallContextFromText } from './signatureHelp.js';
+import { rstToMarkdown } from './rstToMarkdown.js';
 
 // Create a connection for the server using Node's IPC as a transport.
 const connection = createConnection(ProposedFeatures.all);
@@ -124,13 +126,10 @@ const sageBackend = new SageBackend({
 });
 
 function lookupKey(word: string): string {
-	if (SAGEMATH_BUILTINS.includes(word)) {
-		return word;
-	}
-	if (SAGEMATH_METHODS.includes(word)) {
-		return 'method:' + word;
-	}
-	return word; // unknown -> daemon allowlist will reject it
+	// The jedi/getattr daemon resolves any bare or dotted name directly;
+	// method names not present on sage.all simply fail to resolve and fall
+	// back to the bundled docs, so no "method:" prefix is needed.
+	return word;
 }
 
 function isKnownSageSymbol(word: string): boolean {
@@ -439,6 +438,44 @@ function isPartialMatch(input: string, target: string): boolean {
 	return false;
 }
 
+// Map jedi completion "type" strings to LSP CompletionItemKind.
+function jediKindToLspKind(kind: string): CompletionItemKind {
+	switch (kind) {
+		case 'function': return CompletionItemKind.Function;
+		case 'class': return CompletionItemKind.Class;
+		case 'method': return CompletionItemKind.Method;
+		case 'module': return CompletionItemKind.Module;
+		case 'instance': return CompletionItemKind.Value;
+		case 'property': return CompletionItemKind.Property;
+		case 'keyword': return CompletionItemKind.Keyword;
+		case 'param': return CompletionItemKind.Field;
+		case 'statement': return CompletionItemKind.Variable;
+		default: return CompletionItemKind.Text;
+	}
+}
+
+// Returns true if the cursor is in a dotted-access context (e.g. `obj.` or
+// `obj.par`), based on the current line text up to the cursor.
+function isDottedContext(lineBeforeCursor: string, currentWord: string): boolean {
+	const idx = lineBeforeCursor.length - currentWord.length - 1;
+	if (idx < 0) {
+		return false;
+	}
+	return lineBeforeCursor[idx] === '.';
+}
+
+// Find keyword arguments already used in the current call (before the cursor),
+// so we don't re-offer them. Returns a Set of lowercase names.
+function findUsedKwargs(lineBeforeCursor: string): Set<string> {
+	const used = new Set<string>();
+	const re = /([A-Za-z_]\w*)\s*=/g;
+	let m: RegExpExecArray | null;
+	while ((m = re.exec(lineBeforeCursor)) !== null) {
+		used.add(m[1].toLowerCase());
+	}
+	return used;
+}
+
 // This handler provides the initial list of the completion items.
 connection.onCompletion(
 	async (textDocumentPosition: TextDocumentPositionParams): Promise<CompletionItem[]> => {
@@ -447,37 +484,101 @@ connection.onCompletion(
 			return [];
 		}
 
-		// Check if completion is enabled for this document
 		const settings = await getDocumentSettings(textDocumentPosition.textDocument.uri);
 		if (!settings.enableCompletion) {
 			return [];
 		}
 
-		// Get the current word being typed
-		const currentWord = getWordAtPosition(document, textDocumentPosition.position);
+		const pos = textDocumentPosition.position;
+		const lineText = document.getText({
+			start: { line: pos.line, character: 0 },
+			end: pos
+		});
+		const currentWord = getWordAtPosition(document, pos);
 		const items: CompletionItem[] = [];
+		const sageReady = sageBackend.isAvailable();
 
-		// Add filtered SageMath built-ins
+		// ---- Context 1: inside a function call -> keyword-argument completion.
+		// Jedi's complete() returns globals here (useless); instead we offer the
+		// callee's parameters from signature analysis, minus already-used kwargs.
+		const callCtx = getCallContextFromText(lineText);
+		if (callCtx) {
+			if (sageReady) {
+				const sigRes = await sageBackend.analyze('signatures', document.getText(), pos.line, pos.character, 5000);
+				if (sigRes && !sigRes.error && sigRes.signatures && sigRes.signatures.length > 0) {
+					const params = sigRes.signatures[0].params || [];
+					const used = findUsedKwargs(lineText);
+					for (const p of params) {
+						if (!p.name || used.has(p.name.toLowerCase())) {
+							continue;
+						}
+						items.push({
+							label: p.name,
+							kind: CompletionItemKind.Field,
+							detail: p.default ? `keyword argument (default ${p.default})` : 'keyword argument',
+							insertText: `${p.name}=`,
+							filterText: p.name,
+							sortText: '0' + p.name.toLowerCase()
+						});
+					}
+				}
+			}
+			return items;
+		}
+		// ---- Context 2: dotted access (obj. or obj.par) -> attribute/method
+		// completion via jedi. Falls back to the static method list when jedi
+		// cannot infer the receiver type (e.g. cython singletons / constructors).
+		if (isDottedContext(lineText, currentWord)) {
+			if (sageReady) {
+				const res = await sageBackend.analyze('complete', document.getText(), pos.line, pos.character, 5000);
+				if (res && !res.error && res.items && res.items.length > 0) {
+					for (const it of res.items) {
+						const summary = it.doc ? rstToMarkdown(it.doc).split('\n').find(l => l.trim()) ?? '' : '';
+						items.push({
+							label: it.label,
+							kind: jediKindToLspKind(it.kind),
+							detail: it.kind,
+							documentation: summary ? { kind: MarkupKind.Markdown, value: summary } : undefined,
+							insertText: it.label,
+							sortText: it.label
+						});
+					}
+					return items;
+				}
+			}
+			// Fallback: static common-method list (still useful when jedi gives up).
+			SAGEMATH_METHODS.forEach((method) => {
+				if (isPartialMatch(currentWord, method)) {
+					const cachedMethod = getCachedDoc(method);
+					items.push({
+						label: method,
+						kind: CompletionItemKind.Method,
+						detail: cachedMethod?.signature ?? 'SageMath method',
+						insertText: method,
+						filterText: method,
+						sortText: method.toLowerCase()
+					});
+				}
+			});
+			return items;
+		}
+
+		// ---- Context 3: general -> static prioritized list merged with jedi
+		// extras (covers names not in our hardcoded list, e.g. MatrixSpace).
+		const seen = new Set<string>();
+
 		SAGEMATH_BUILTINS.forEach((builtin, index) => {
 			if (isPartialMatch(currentWord, builtin)) {
-				// Enhanced sorting: prioritize important functions and exact prefix matches
-				let sortPriority = '1'; // Default priority
-				
+				let sortPriority = '1';
 				if (currentWord && builtin.toLowerCase().startsWith(currentWord.toLowerCase())) {
-					// Exact prefix match gets highest priority
 					sortPriority = '0';
 				} else if (currentWord && builtin.toLowerCase().includes(currentWord.toLowerCase())) {
-					// Substring match gets medium priority
 					sortPriority = '0.5';
 				}
-				
-				// Special handling for very important functions
 				const importantFunctions = ['PolynomialRing', 'matrix', 'plot', 'EllipticCurve', 'Graph'];
 				if (importantFunctions.includes(builtin) && isPartialMatch(currentWord, builtin)) {
-					// Boost priority for important functions
 					sortPriority = '0' + sortPriority;
 				}
-				
 				const cachedBuiltin = getCachedDoc(builtin);
 				items.push({
 					label: builtin,
@@ -489,19 +590,16 @@ connection.onCompletion(
 					filterText: builtin,
 					sortText: sortPriority + builtin.toLowerCase()
 				});
+				seen.add(builtin.toLowerCase());
 			}
 		});
 
-		// Add filtered common methods
 		SAGEMATH_METHODS.forEach((method, index) => {
 			if (isPartialMatch(currentWord, method)) {
-				// Consistent sorting for methods
-				let sortPriority = '2'; // Lower priority than built-ins
-				
+				let sortPriority = '2';
 				if (currentWord && method.toLowerCase().startsWith(currentWord.toLowerCase())) {
-					sortPriority = '1.5'; // Better than default methods but after built-ins
+					sortPriority = '1.5';
 				}
-				
 				const cachedMethod = getCachedDoc(method);
 				items.push({
 					label: method,
@@ -513,8 +611,36 @@ connection.onCompletion(
 					filterText: method,
 					sortText: sortPriority + method.toLowerCase()
 				});
+				seen.add(method.toLowerCase());
 			}
 		});
+
+		// Jedi extras (e.g. MatrixSpace, NumberField variants, user imports).
+		if (sageReady) {
+			const res = await sageBackend.analyze('complete', document.getText(), pos.line, pos.character, 3000);
+			if (res && !res.error && res.items) {
+				for (const it of res.items) {
+					const key = it.label.toLowerCase();
+					if (seen.has(key)) {
+						continue;
+					}
+					if (currentWord && !isPartialMatch(currentWord, it.label)) {
+						continue;
+					}
+					const summary = it.doc ? rstToMarkdown(it.doc).split('\n').find(l => l.trim()) ?? '' : '';
+					items.push({
+						label: it.label,
+						kind: jediKindToLspKind(it.kind),
+						detail: it.kind,
+						documentation: summary ? { kind: MarkupKind.Markdown, value: summary } : undefined,
+						insertText: it.label,
+						filterText: it.label,
+						sortText: '3' + it.label.toLowerCase()
+					});
+					seen.add(key);
+				}
+			}
+		}
 
 		return items;
 	}
@@ -586,8 +712,19 @@ connection.onHover(
 		const word = wordRange.word;
 		const lines: string[] = [];
 
-		// 1. SageMath built-in / method documentation (live sage -> bundled fallback)
-		const sageDoc = await resolveDoc(word, settings);
+		// 1. Live documentation: prefer position-based jedi analysis (rich,
+		//    in-context, resolves user code + dotted names), then fall back to a
+		//    name lookup, then to the bundled one-line docs.
+		let sageDoc: SymbolDoc | undefined;
+		const hoverResult = await sageBackend.analyze(
+			'hover', document.getText(), textDocumentPosition.position.line, textDocumentPosition.position.character
+		);
+		if (hoverResult && !hoverResult.error && !hoverResult.empty) {
+			sageDoc = docFromHoverResult(hoverResult.name || word, hoverResult);
+		}
+		if (!sageDoc) {
+			sageDoc = await resolveDoc(word, settings);
+		}
 		if (sageDoc) {
 			const kind = isMethodWord(word) ? 'method' : 'built-in';
 			lines.push(`**${word}** *(SageMath ${kind})*`);
@@ -701,9 +838,9 @@ connection.onReferences(
 	}
 );
 
-// Provide signature help: parameter hints while typing inside a call. Uses the
-// live sage argspec when available (via the cached/resolved SymbolDoc), so the
-// active parameter advances as the user types commas.
+// Provide signature help: parameter hints while typing inside a call. Uses
+// position-based jedi analysis for rich, in-context signatures; falls back to
+// the resolved-name signature when jedi cannot infer the call.
 connection.onSignatureHelp(
 	async (params): Promise<SignatureHelp | undefined> => {
 		const document = documents.get(params.textDocument.uri);
@@ -715,23 +852,35 @@ connection.onSignatureHelp(
 			return undefined;
 		}
 
-		// Use a window of text before the cursor so multi-line calls resolve.
+		// 1. Position-based jedi signatures (best -- resolves the actual call).
+		const sigResult = await sageBackend.analyze(
+			'signatures', document.getText(), params.position.line, params.position.character
+		);
+		if (sigResult && !sigResult.error && sigResult.signatures && sigResult.signatures.length > 0) {
+			const jsig = sigResult.signatures[0];
+			const parameters = jsig.params.map(p =>
+				ParameterInformation.create(p.default ? `${p.name}=${p.default}` : p.name, '')
+			);
+			const sig = SignatureInformation.create(jsig.label, '', ...parameters);
+			sig.activeParameter = Math.min(jsig.active_parameter, Math.max(0, parameters.length - 1));
+			return {
+				signatures: [sig],
+				activeSignature: 0,
+				activeParameter: sig.activeParameter
+			};
+		}
+
+		// 2. Fallback: resolve the callee via the call-context parser + lookup.
 		const offset = document.offsetAt(params.position);
 		const before = document.getText().slice(Math.max(0, offset - 2000), offset);
 		const ctx = getCallContextFromText(before);
-		if (!ctx) {
+		if (!ctx || !isKnownSageSymbol(ctx.callee)) {
 			return undefined;
 		}
-		// Only offer hints for symbols we know about.
-		if (!isKnownSageSymbol(ctx.callee)) {
-			return undefined;
-		}
-
 		const doc = await resolveDoc(ctx.callee, settings);
 		if (!doc || !doc.params || doc.params.length === 0) {
 			return undefined;
 		}
-
 		const parameters = doc.params.map(p =>
 			ParameterInformation.create(
 				p.default ? `${p.name}=${p.default}` : p.name,
@@ -739,9 +888,7 @@ connection.onSignatureHelp(
 			)
 		);
 		const sig = SignatureInformation.create(
-			doc.signature ?? `${ctx.callee}(...)`,
-			doc.summary,
-			...parameters
+			doc.signature ?? `${ctx.callee}(...)`, doc.summary, ...parameters
 		);
 		sig.activeParameter = Math.min(ctx.argIndex, parameters.length - 1);
 		return {
