@@ -79,6 +79,35 @@
           "default": true,
           "description": "Enable hover documentation and information"
         },
+        "sagemathEnhanced.enableSageDocs": {
+          "type": "boolean",
+          "default": true,
+          "description": "Use the installed SageMath runtime to provide accurate documentation and function signatures (via a background sage process). When disabled or unavailable, falls back to the bundled documentation."
+        },
+        "sagemathEnhanced.sagePythonPath": {
+          "type": "string",
+          "default": "",
+          "description": "Python interpreter used to run the documentation daemon when `sage -python` is not available (e.g. conda/micromamba installs where sage is importable from the env's python). Leave empty to auto-detect (tries the configured interpreter path, then `python`, then `python3`)."
+        },
+        "sagemathEnhanced.sageDocLaunchMethod": {
+          "type": "string",
+          "default": "auto",
+          "description": "How the documentation daemon is launched. \"auto\" tries methods in order and remembers the one that works. You can pin one of: \"auto\", \"sage -python\", \"sage --python\", \"python\", \"python3\", or the value of sagePythonPath (if set). Pinning avoids the auto-detection probe on every restart."
+        },
+        "sagemathEnhanced.hoverVerbosity": {
+          "type": "string",
+          "enum": [
+            "short",
+            "full"
+          ],
+          "default": "full",
+          "description": "Verbosity of hover documentation. \"short\" shows only the signature and summary; \"full\" adds the description, parameter table, and examples."
+        },
+        "sagemathEnhanced.hoverShowExamples": {
+          "type": "boolean",
+          "default": true,
+          "description": "Show code examples in hover documentation (only applies when verbosity is \"full\")."
+        },
         "sagemathEnhanced.logLevel": {
           "type": "string",
           "enum": [

@@ -222,4 +222,20 @@ publishes a release on pushes to `main` (see `docs/RELEASE_PROCESS.md`).
   changes, or build from a clean checkout.
 - **Changes not picked up after editing:** You forgot to recompile. Either run
   `npm: watch` or relaunch F5 (the `preLaunchTask` recompiles).
+- **Hover/completion shows only short bundled docs (no live signatures):** the
+  live-docs daemon could not start SageMath. The language server logs which
+  launch method it tried in the **SageMath Enhanced** output channel (lines like
+  `[sage-docs] trying launch method: …` / `sage backend ready via "…"` /
+  `all launch methods failed: …`). Common fixes:
+  - Activate the SageMath environment *before* launching VS Code
+    (e.g. `micromamba activate sage && code .`) so `sage`/`python` with sage is
+    on `PATH`.
+  - `sage -python` is not available in some packagings; the server falls back to
+    `python`/`python3` automatically. If auto-detection fails, set
+    **`sagemathEnhanced.sagePythonPath`** to the exact Python that has SageMath
+    importable (e.g. `/opt/sage/local/bin/python3`), or pin
+    **`sagemathEnhanced.sageDocLaunchMethod`** to e.g. `"python"`.
+  - Set **`sagemathEnhanced.logLevel`** to `debug` for more detail.
+  - You can always disable the runtime integration with
+    **`sagemathEnhanced.enableSageDocs: false`** to use only the bundled docs.
 
