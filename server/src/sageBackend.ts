@@ -153,6 +153,34 @@ export class SageBackend {
 	}
 
 	/**
+	 * Fire-and-forget namespace sync (debounced by the caller). Sends the
+	 * document text so the daemon can execute eligible assignments/imports and
+	 * build a live namespace for constructed-object completion (M.det on
+	 * M = matrix(...)). No-op when the backend is disabled/unavailable.
+	 */
+	syncNamespace(text: string, enabled: boolean, timeoutMs = 30000): void {
+		if (!this.enabled || (this.state !== 'ready' && this.state !== 'starting')) {
+			return;
+		}
+		// Don't await; namespace sync is best-effort and must never block the
+		// language server. Fire-and-forget with its own timeout.
+		this.start().then(() => {
+			if (this.state !== 'ready' || !this.proc || !this.proc.stdin) {
+				return;
+			}
+			const id = this.nextId++;
+			const timer = setTimeout(() => { this.pending.delete(id); }, timeoutMs);
+			this.pending.set(id, { resolve: () => undefined, timer });
+			try {
+				this.proc!.stdin!.write(JSON.stringify({ id, op: 'sync_namespace', text, enabled }) + '\n');
+			} catch {
+				clearTimeout(timer);
+				this.pending.delete(id);
+			}
+		}).catch(() => { /* ignore */ });
+	}
+
+	/**
 	 * Position-based analysis (hover/signatures/complete). NOT cached -- the
 	 * result depends on document text + cursor, which change constantly.
 	 * Returns an error result when the backend is unavailable so callers can

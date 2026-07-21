@@ -35,9 +35,19 @@ Check [Keep a Changelog](http://keepachangelog.com/) for recommendations on how 
 - **Robust daemon launch**: tries `sage -python`, `sage --python`, the
   configured `sagePythonPath`, `python`, `python3` in order, remembering the one
   that works (fixes conda/micromamba installs where `sage -python` is absent).
+- **Constructed-object completion (live namespace)**: typing `M.` on
+  `M = matrix([[1,2],[3,4]])` now offers the object's real methods (`det`,
+  `rank`, `transpose`, …) with live docs. The daemon evaluates simple
+  assignments and imports from the document in the background sage process
+  (AST-validated: no comprehensions, exec/eval, or dunder access; each with a
+  timeout). Also fixes `ZZ.`, `QQ.` (Cython singletons jedi can't see) via a
+  `dir()` fallback, and imported modules (`import numpy as np` → `np.` works).
+  Gated by `sagemathEnhanced.enableLiveNamespace` (default on; disable for a
+  fully static experience).
 - **New settings**: `sagemathEnhanced.enableSageDocs`,
   `sagemathEnhanced.hoverVerbosity`, `sagemathEnhanced.hoverShowExamples`,
-  `sagemathEnhanced.sagePythonPath`, `sagemathEnhanced.sageDocLaunchMethod`.
+  `sagemathEnhanced.sagePythonPath`, `sagemathEnhanced.sageDocLaunchMethod`,
+  `sagemathEnhanced.enableLiveNamespace`.
 
 ### Changed
 

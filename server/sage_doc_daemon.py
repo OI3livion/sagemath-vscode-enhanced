@@ -22,6 +22,8 @@ LSP sends 0-based line/col. Internally we convert to jedi's 1-based line.
 import json
 import re
 import sys
+import ast
+import threading
 
 STARTUP_ERROR = None
 SAGE_AVAILABLE = False
@@ -134,6 +136,219 @@ def _result_for_obj(obj, source):
         "callable": callable(obj),
         "source": source,
     }
+
+
+# ---------------------------------------------------------------------------
+# Document namespace: AST-validated execution of simple assignments + imports
+# so completion/hover work on constructed objects (M = matrix(...) -> M.det).
+# Gated by enableLiveNamespace (the TS side sends sync_namespace only when on).
+# ---------------------------------------------------------------------------
+
+_UNSAFE_CALLS = {"eval", "exec", "compile", "__import__", "globals",
+                 "locals", "vars", "getattr", "setattr", "delattr"}
+
+_ALLOWED_EXPR_NODES = (
+    ast.Call, ast.Name, ast.Attribute, ast.Constant,
+    ast.BinOp, ast.UnaryOp, ast.Tuple, ast.List, ast.Set, ast.Dict,
+    ast.keyword, ast.arg, ast.Load,
+    ast.FormattedValue, ast.JoinedStr,
+)
+# Backwards-compat aliases deprecated in 3.8, removed in 3.14 (Constant unifies
+# Num/Str/Bytes/NameConstant/Ellipsis). Add them only if present.
+for _legacy in ('Num', 'Str', 'Bytes', 'NameConstant', 'Ellipsis'):
+    if hasattr(ast, _legacy):
+        _ALLOWED_EXPR_NODES += (getattr(ast, _legacy),)
+
+
+def _rhs_is_safe(node):
+    """Recursively check that an assignment RHS only uses allowed constructs."""
+    # Operator/comparator marker nodes (ast.Add, ast.USub, ast.Eq, etc.) are
+    # always safe -- they carry no code, just the operation type.
+    if isinstance(node, (ast.operator, ast.unaryop, ast.cmpop, ast.boolop)):
+        return True
+    if isinstance(node, ast.Call):
+        if isinstance(node.func, ast.Name) and node.func.id in _UNSAFE_CALLS:
+            return False
+        if isinstance(node.func, ast.Attribute) and node.func.attr.startswith("_"):
+            return False
+    elif isinstance(node, ast.Attribute):
+        if node.attr.startswith("_"):
+            return False
+    elif isinstance(node, ast.Subscript):
+        if not _rhs_is_safe(node.value):
+            return False
+        sl = node.slice
+        if isinstance(sl, ast.Slice):
+            return False
+        if isinstance(sl, ast.Index):  # pragma: no cover (py<3.9)
+            sl = sl.value
+        return _rhs_is_safe(sl)
+    elif isinstance(node, ast.keyword):
+        if node.arg is not None and node.arg.startswith("_"):
+            return False
+        return _rhs_is_safe(node.value) if node.value is not None else True
+    if isinstance(node, (ast.ListComp, ast.SetComp, ast.DictComp, ast.GeneratorExp)):
+        return False
+    if isinstance(node, (ast.Starred, ast.Await, ast.Yield, ast.YieldFrom,
+                         ast.Lambda, ast.IfExp, ast.NamedExpr)):
+        return False
+    if not isinstance(node, _ALLOWED_EXPR_NODES):
+        return False
+    for child in ast.iter_child_nodes(node):
+        if not _rhs_is_safe(child):
+            return False
+    return True
+
+
+def _statement_is_eligible(stmt):
+    """Return (kind, info) for an executable statement, or (None, None)."""
+    if isinstance(stmt, (ast.Import, ast.ImportFrom)):
+        return ("import", [(a.asname or a.name, None) for a in stmt.names])
+    if isinstance(stmt, ast.Assign):
+        targets = []
+        for t in stmt.targets:
+            if not isinstance(t, ast.Name):
+                return (None, None)
+            targets.append(t.id)
+        if not _rhs_is_safe(stmt.value):
+            return (None, None)
+        return ("assign", (targets, stmt.value))
+    if isinstance(stmt, ast.AnnAssign):
+        if not isinstance(stmt.target, ast.Name) or stmt.value is None:
+            return (None, None)
+        if not _rhs_is_safe(stmt.value):
+            return (None, None)
+        return ("assign", ([stmt.target.id], stmt.value))
+    return (None, None)
+
+
+# The live document namespace: name -> live object. Populated by sync_namespace.
+_NAMESPACE = {}
+_NAMESPACE_LOCK = threading.Lock()
+# Hash of the statement set currently materialised, so unchanged syncs are no-ops.
+_NAMESPACE_HASH = None
+
+
+def sync_namespace(text, timeout=2.0, enabled=True):
+    """Rebuild _NAMESPACE from `text` by executing eligible statements.
+
+    Safe by construction: only Import/ImportFrom and simple-Name assignments
+    whose RHS passes _rhs_is_safe are executed, each in try/except, each with a
+    per-statement timeout. Gated by the enableLiveNamespace setting.
+    """
+    global _NAMESPACE_HASH
+    if not enabled or not SAGE_AVAILABLE:
+        return {"synced": False, "reason": "disabled" if not enabled else "no sage"}
+    try:
+        tree = ast.parse(text or "")
+    except SyntaxError:
+        return {"synced": False, "reason": "syntax error"}  # mid-typing: keep ns
+    except Exception as exc:
+        return {"synced": False, "reason": "parse: %s" % exc}
+
+    eligible = [ast.dump(s) for s in tree.body if _statement_is_eligible(s)[0]]
+    import hashlib
+    h = hashlib.sha1(repr(eligible).encode("utf-8")).hexdigest()
+    if h == _NAMESPACE_HASH:
+        return {"synced": True, "changed": False, "names": len(_NAMESPACE)}
+
+    ns = {"__name__": "__sage_namespace__"}
+    try:
+        for k in dir(sage.all):
+            if not k.startswith("_"):
+                ns[k] = getattr(sage.all, k)
+    except Exception:
+        pass
+    executed, failed = 0, 0
+    for stmt in tree.body:
+        if _statement_is_eligible(stmt)[0] is None:
+            continue
+        try:
+            code = compile(ast.Module(body=[stmt], type_ignores=[]),
+                           "<namespace>", "exec")
+        except Exception:
+            failed += 1
+            continue
+        result = {}
+
+        def _run(code=code, ns=ns):
+            try:
+                exec(code, ns)  # noqa: S102 - gated by AST validation + setting
+                result["ok"] = True
+            except Exception as exc:
+                result["ok"] = False
+                result["err"] = "%s" % exc
+
+        th = threading.Thread(target=_run, daemon=True)
+        th.start()
+        th.join(timeout)
+        if th.is_alive() or not result.get("ok"):
+            failed += 1
+            continue
+        executed += 1
+    with _NAMESPACE_LOCK:
+        _NAMESPACE.clear()
+        for k, v in ns.items():
+            if not k.startswith("_") and not isinstance(v, type(sys)):
+                _NAMESPACE[k] = v
+        _NAMESPACE_HASH = h
+    return {"synced": True, "changed": True, "executed": executed,
+            "failed": failed, "names": len(_NAMESPACE)}
+
+
+def _resolve_in_namespace(name):
+    """Resolve a bare/dotted name against the live namespace first, then
+    sage.all. Returns (obj, source) or (None, None)."""
+    if not name:
+        return None, None
+    parts = name.split(".")
+    base = parts[0]
+    obj = None
+    in_ns = False
+    with _NAMESPACE_LOCK:
+        if base in _NAMESPACE:
+            obj = _NAMESPACE[base]
+            in_ns = True
+    if obj is None:
+        obj, _ = _safe_resolve(base)
+        if obj is None:
+            return None, None
+    try:
+        for p in parts[1:]:
+            if p.startswith("_"):
+                return None, None
+            obj = getattr(obj, p)
+    except Exception:
+        return None, None
+    return obj, ("namespace" if in_ns else "getattr")
+
+
+def _dir_completion(obj, prefix=""):
+    """Build completion items from dir(obj), filtered + paired with doc summary."""
+    items = []
+    try:
+        names = dir(obj)
+    except Exception:
+        return items
+    for name in names:
+        if name.startswith("_"):
+            continue
+        if prefix and not name.lower().startswith(prefix.lower()):
+            continue
+        try:
+            attr = getattr(obj, name)
+        except Exception:
+            continue
+        doc = _doc_of(attr)
+        summary = doc.strip().split("\n", 1)[0][:200] if doc else ""
+        kind = "method" if callable(attr) else "property"
+        items.append({
+            "label": name, "kind": kind, "detail": kind,
+            "doc": summary, "complete": name,
+        })
+    return items
+
+
 # ---------------------------------------------------------------------------
 # Jedi-based operations
 # ---------------------------------------------------------------------------
@@ -219,7 +434,16 @@ def op_hover(text, line, col):
     if script is None:
         return {"empty": True}
     jline = line + 1 + PRELUDE_LINES
-    # Try to infer the name under the cursor.
+    # 1. Live namespace first (constructed objects + dotted attributes).
+    word = _word_at(text, line, col)
+    if word:
+        recv, src = _resolve_in_namespace(word)
+        if recv is not None:
+            r = _result_for_obj(recv, src or "namespace")
+            sig = _format_signature(word, r)
+            return {"name": word, "doc": r["doc"], "signature": sig,
+                    "kind": type(recv).__name__, "source": src or "namespace"}
+    # 2. Jedi infer.
     try:
         names = script.infer(jline, col)
     except Exception:
@@ -230,8 +454,7 @@ def op_hover(text, line, col):
         if doc:
             return {"name": label, "doc": doc, "signature": sig,
                     "kind": n.type, "source": "jedi"}
-    # Fallback: extract the word and resolve via getattr.
-    word = _word_at(text, line, col)
+    # 3. getattr-on-sage.all fallback.
     if word:
         obj, err = _safe_resolve(word)
         if obj is not None:
@@ -305,16 +528,24 @@ def op_signatures(text, line, col):
                 "params": params,
                 "active_parameter": s.index if s.index is not None else 0,
             })
-    # Fallback via getattr on the callee word.
+    # Fallback: resolve the callee via the namespace first, then getattr lookup.
     if not sigs_out:
-        word = _word_at(text, line, col)
-        # Walk back to the callee before the '('.
         callee = _callee_before(text, line, col)
         if callee:
-            r = op_lookup(callee)
-            if r and r.get("doc") is not None and not r.get("error"):
-                label = _format_signature(callee, r)
-                args = r.get("args") or []
+            # 1. Live namespace (constructed objects' methods: M.method()
+            recv, src = _resolve_in_namespace(callee)
+            if recv is None:
+                # 2. Top-level name lookup
+                r = op_lookup(callee)
+                if r and r.get("doc") is not None and not r.get("error"):
+                    recv_r = r
+                else:
+                    recv_r = None
+            else:
+                recv_r = _result_for_obj(recv, src or "namespace")
+            if recv_r:
+                label = _format_signature(callee, recv_r)
+                args = recv_r.get("args") or []
                 params = [{"name": a, "default": ""} for a in args]
                 sigs_out.append({"label": label, "params": params, "active_parameter": 0})
     return {"signatures": sigs_out}
@@ -350,22 +581,53 @@ def _callee_before(text, line, col):
 
 
 def op_complete(text, line, col):
-    """Completions at 0-based (line, col)."""
+    """Completions at 0-based (line, col).
+
+    Priority: document namespace (live constructed objects) -> jedi ->
+    getattr-on-sage.all dir() fallback (for ZZ. etc. that jedi can't see).
+    """
     script = _jedi_script(text)
     items = []
+    # Determine the dotted receiver (e.g. "M." or "obj.par") from the line.
+    line_text = (text or "").split("\n")[line] if text and line < len(text.split("\n")) else ""
+    left = line_text[:col] if col <= len(line_text) else line_text
+    dotted_match = re.search(r"([A-Za-z_]\w*(\.[A-Za-z_]\w*)*)\.\s*([A-Za-z_]?\w*)$", left)
+    if dotted_match:
+        recv_name = dotted_match.group(1)
+        prefix = dotted_match.group(3)
+        # 1. Live namespace (constructed objects: M = matrix(...))
+        recv, src = _resolve_in_namespace(recv_name)
+        if recv is not None:
+            items = _dir_completion(recv, prefix)
+            if items:
+                return {"items": items}
+        # 2. Jedi on the dotted position
+        if script is not None:
+            jline = line + 1 + PRELUDE_LINES
+            try:
+                comps = script.complete(jline, col)
+            except Exception:
+                comps = []
+            for c in comps[:500]:
+                items.append({
+                    "label": c.name, "kind": c.type, "detail": "",
+                    "doc": (c.docstring(raw=True) or "")[:4000], "complete": c.complete,
+                })
+            if items:
+                return {"items": items}
+        # 3. (recv was None here) nothing more to try for an unresolvable recv.
+        return {"items": items}
+    # Non-dotted context: jedi only (general completion is handled TS-side).
     if script is not None:
         jline = line + 1 + PRELUDE_LINES
         try:
             comps = script.complete(jline, col)
         except Exception:
             comps = []
-        for c in comps[:200]:
+        for c in comps[:500]:
             items.append({
-                "label": c.name,
-                "kind": c.type,
-                "detail": "",
-                "doc": (c.docstring(raw=True) or "")[:4000],
-                "complete": c.complete,
+                "label": c.name, "kind": c.type, "detail": "",
+                "doc": (c.docstring(raw=True) or "")[:4000], "complete": c.complete,
             })
     return {"items": items}
 
@@ -401,6 +663,8 @@ def main():
                 result = op_signatures(req.get("text", ""), req.get("line", 0), req.get("col", 0))
             elif op == "complete":
                 result = op_complete(req.get("text", ""), req.get("line", 0), req.get("col", 0))
+            elif op == "sync_namespace":
+                result = sync_namespace(req.get("text", ""), enabled=bool(req.get("enabled", True)))
             else:
                 result = {"error": "unknown op: %r" % op}
         except Exception as exc:

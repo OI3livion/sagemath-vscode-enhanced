@@ -258,6 +258,7 @@ interface SageMathSettings {
 	hoverShowExamples: boolean;
 	sagePythonPath: string;
 	sageDocLaunchMethod: string;
+	enableLiveNamespace: boolean;
 }
 
 // The global settings, used when the `workspace/configuration` request is not supported by the client.
@@ -271,7 +272,8 @@ const defaultSettings: SageMathSettings = {
 	hoverVerbosity: 'full',
 	hoverShowExamples: true,
 	sagePythonPath: '',
-	sageDocLaunchMethod: 'auto'
+	sageDocLaunchMethod: 'auto',
+	enableLiveNamespace: true
 };
 let globalSettings: SageMathSettings = defaultSettings;
 // Most recently observed document settings; used by handlers (like
@@ -322,6 +324,9 @@ documents.onDidClose(e => {
 // The content of a text document has changed. This event is emitted
 // when the text document first opened or when its content has changed.
 let prewarmed = false;
+// Debounced namespace-sync state: one timer per document, so rapid keystrokes
+// don't flood the daemon. Re-syncs 500ms after the last edit.
+const namespaceTimers = new Map<string, NodeJS.Timeout>();
 documents.onDidChangeContent(change => {
 	validateTextDocument(change.document);
 	// Kick off the sage daemon import in the background on the first sage
@@ -330,6 +335,19 @@ documents.onDidChangeContent(change => {
 		prewarmed = true;
 		sageBackend.prewarm().catch(() => { /* ignore */ });
 	}
+	// Debounced namespace sync (constructed-object completion: M.det on M = ...).
+	const uri = change.document.uri;
+	const existing = namespaceTimers.get(uri);
+	if (existing) {
+		clearTimeout(existing);
+	}
+	const timer = setTimeout(() => {
+		namespaceTimers.delete(uri);
+		getDocumentSettings(uri).then(settings => {
+			sageBackend.syncNamespace(change.document.getText(), settings.enableLiveNamespace);
+		}, () => { /* ignore */ });
+	}, 500);
+	namespaceTimers.set(uri, timer);
 });
 
 async function validateTextDocument(textDocument: TextDocument): Promise<void> {

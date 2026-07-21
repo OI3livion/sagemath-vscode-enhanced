@@ -94,6 +94,11 @@
           "default": "auto",
           "description": "How the documentation daemon is launched. \"auto\" tries methods in order and remembers the one that works. You can pin one of: \"auto\", \"sage -python\", \"sage --python\", \"python\", \"python3\", or the value of sagePythonPath (if set). Pinning avoids the auto-detection probe on every restart."
         },
+        "sagemathEnhanced.enableLiveNamespace": {
+          "type": "boolean",
+          "default": true,
+          "description": "Evaluate simple assignment and import statements from the document in the background sage process, so completion and hover work on constructed objects (e.g. M.det on M = matrix(...)) and imported modules. Only plain assignments and imports whose right-hand side passes AST validation (no comprehensions, attribute writes, exec/eval/__import__, or dunder access) are executed, one at a time, each with a timeout. Disable for a fully static experience."
+        },
         "sagemathEnhanced.hoverVerbosity": {
           "type": "string",
           "enum": [
