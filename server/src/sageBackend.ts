@@ -183,14 +183,15 @@ export class SageBackend {
 	/**
 	 * Position-based analysis (hover/signatures/complete). NOT cached -- the
 	 * result depends on document text + cursor, which change constantly.
-	 * Returns an error result when the backend is unavailable so callers can
-	 * fall back.
+	 * `docPath` is the document's filesystem path: the daemon hands it to jedi
+	 * so imports of sibling modules resolve. Returns an error result when the
+	 * backend is unavailable so callers can fall back.
 	 */
-	analyze(op: 'hover' | 'signatures' | 'complete', text: string, line: number, col: number, timeoutMs = 15000): Promise<SageDocResult> {
-		return this.analyzeUncached(op, text, line, col, timeoutMs);
+	analyze(op: 'hover' | 'signatures' | 'complete', text: string, line: number, col: number, timeoutMs = 15000, docPath?: string): Promise<SageDocResult> {
+		return this.analyzeUncached(op, text, line, col, timeoutMs, docPath);
 	}
 
-	private async analyzeUncached(op: string, text: string, line: number, col: number, timeoutMs: number): Promise<SageDocResult> {
+	private async analyzeUncached(op: string, text: string, line: number, col: number, timeoutMs: number, docPath?: string): Promise<SageDocResult> {
 		if (!this.enabled) {
 			return { error: 'sage backend disabled' };
 		}
@@ -209,7 +210,11 @@ export class SageBackend {
 			}, timeoutMs);
 			this.pending.set(id, { resolve: settle, timer });
 			try {
-				this.proc!.stdin!.write(JSON.stringify({ id, op, text, line, col }) + '\n');
+				const req: Record<string, unknown> = { id, op, text, line, col };
+				if (docPath) {
+					req.path = docPath;
+				}
+				this.proc!.stdin!.write(JSON.stringify(req) + '\n');
 			} catch (err) {
 				clearTimeout(timer);
 				this.pending.delete(id);

@@ -14,10 +14,19 @@ NO eval, NO allowlist, NO arbitrary code execution from editor text:
 Line-delimited JSON over stdio:
   handshake: {"ready": true, "sage": <bool>, "jedi": <bool>, "error": null|str}
   request:   {"id": <int>, "op": "lookup"|"hover"|"signatures"|"complete",
-              "name"?: str, "text"?: str, "line"?: int (0-based), "col"?: int}
+              "name"?: str, "text"?: str, "line"?: int (0-based), "col"?: int,
+              "path"?: str (filesystem path of the document, for jedi import
+              resolution of sibling modules)}
   response:  {"id": <int>, "result": {...}}
 
 LSP sends 0-based line/col. Internally we convert to jedi's 1-based line.
+
+.sage text is NOT valid Python ('^', 'R.<x> = ...', '[1..n]', 'f(x) = ...').
+Before any ast.parse / jedi analysis we run it through sage's preparser
+(sage.repl.preparse), which is line-preserving, and map cursor columns by
+preparsing the current line prefix (literals expand: '2^3' becomes
+'Integer(2)**Integer(3)'). Without this, one sage-specific line kills the
+whole namespace sync (ast.parse hard-fails) and degrades jedi.
 """
 import json
 import re
@@ -51,6 +60,13 @@ if SAGE_AVAILABLE:
     except Exception:
         pass
 
+# Sage's preparser: converts .sage source to valid Python. Only importable in
+# the sage environment; everything that uses it degrades to raw text without it.
+try:
+    from sage.repl.preparse import preparse as _sage_preparse
+except Exception:
+    _sage_preparse = None
+
 # A synthetic prelude prepended to user text so Jedi treats the document as a
 # sage session (sage files implicitly have the sage.all namespace). Adds 1 line,
 # so a 0-based LSP line L maps to jedi line L + 2.
@@ -81,6 +97,45 @@ def _safe_resolve(name):
         return obj, None
     except Exception as exc:
         return None, "resolve %r: %s" % (name, exc)
+
+
+def _preparse(text):
+    """Convert .sage source to valid Python via sage's preparser.
+
+    Falls back to the raw text when the preparser is unavailable, raises, or
+    changes the line count (line preservation is required for position
+    mapping; it holds for all standard sage constructs).
+    """
+    text = text or ""
+    if _sage_preparse is None:
+        return text
+    try:
+        out = _sage_preparse(text)
+    except Exception:
+        return text
+    if len(out.splitlines()) != len(text.splitlines()):
+        return text
+    return out
+
+
+def _map_col(line_text, col):
+    """Map a cursor column in a raw .sage line to the matching column in the
+    preparsed line, by preparsing the line prefix (preparse is line-local;
+    literals expand, e.g. '2^3' -> 'Integer(2)**Integer(3)')."""
+    if _sage_preparse is None:
+        return col
+    try:
+        return len(_sage_preparse(line_text[:col]))
+    except Exception:
+        return col
+
+
+def _mapped_jedi_position(text, line, col):
+    """(0-based line, col) over raw text -> (1-based line, col) over the
+    preparsed+prelude text jedi sees."""
+    lines = (text or "").split("\n")
+    raw_line = lines[line] if 0 <= line < len(lines) else ""
+    return line + 1 + PRELUDE_LINES, _map_col(raw_line, col)
 
 
 def _signature_of(obj):
@@ -160,6 +215,13 @@ for _legacy in ('Num', 'Str', 'Bytes', 'NameConstant', 'Ellipsis'):
         _ALLOWED_EXPR_NODES += (getattr(ast, _legacy),)
 
 
+def _attr_is_visible(attr):
+    """Attributes the namespace may read: public ones, plus sage's preparsed
+    generator-unpacking hook `_first_ngens` (emitted for `R.<x> = ...`; a
+    benign read-only constructor helper on rings)."""
+    return not attr.startswith("_") or attr == "_first_ngens"
+
+
 def _rhs_is_safe(node):
     """Recursively check that an assignment RHS only uses allowed constructs."""
     # Operator/comparator marker nodes (ast.Add, ast.USub, ast.Eq, etc.) are
@@ -169,10 +231,10 @@ def _rhs_is_safe(node):
     if isinstance(node, ast.Call):
         if isinstance(node.func, ast.Name) and node.func.id in _UNSAFE_CALLS:
             return False
-        if isinstance(node.func, ast.Attribute) and node.func.attr.startswith("_"):
+        if isinstance(node.func, ast.Attribute) and not _attr_is_visible(node.func.attr):
             return False
     elif isinstance(node, ast.Attribute):
-        if node.attr.startswith("_"):
+        if not _attr_is_visible(node.attr):
             return False
     elif isinstance(node, ast.Subscript):
         if not _rhs_is_safe(node.value):
@@ -207,9 +269,15 @@ def _statement_is_eligible(stmt):
     if isinstance(stmt, ast.Assign):
         targets = []
         for t in stmt.targets:
-            if not isinstance(t, ast.Name):
+            if isinstance(t, ast.Name):
+                targets.append(t.id)
+            elif (isinstance(t, (ast.Tuple, ast.List))
+                  and all(isinstance(e, ast.Name) for e in t.elts)):
+                # Tuple unpacking of plain names, e.g. the preparsed form of
+                # R.<x,y> = ... : (x, y,) = R._first_ngens(2)
+                targets.extend(e.id for e in t.elts)
+            else:
                 return (None, None)
-            targets.append(t.id)
         if not _rhs_is_safe(stmt.value):
             return (None, None)
         return ("assign", (targets, stmt.value))
@@ -240,7 +308,10 @@ def sync_namespace(text, timeout=2.0, enabled=True):
     if not enabled or not SAGE_AVAILABLE:
         return {"synced": False, "reason": "disabled" if not enabled else "no sage"}
     try:
-        tree = ast.parse(text or "")
+        # Preparse so sage syntax (R.<x> = ..., ^, [1..n]) doesn't hard-fail
+        # the whole sync -- ast.parse is not error-tolerant, one bad line used
+        # to kill completion for every constructed object in the document.
+        tree = ast.parse(_preparse(text))
     except SyntaxError:
         return {"synced": False, "reason": "syntax error"}  # mid-typing: keep ns
     except Exception as exc:
@@ -288,8 +359,11 @@ def sync_namespace(text, timeout=2.0, enabled=True):
         executed += 1
     with _NAMESPACE_LOCK:
         _NAMESPACE.clear()
+        # Imported modules are kept: dir() on them is the runtime fallback for
+        # module completion (np., os., local helpers) when jedi's stubs fall
+        # short. Executing imports is already part of the trust model.
         for k, v in ns.items():
-            if not k.startswith("_") and not isinstance(v, type(sys)):
+            if not k.startswith("_"):
                 _NAMESPACE[k] = v
         _NAMESPACE_HASH = h
     return {"synced": True, "changed": True, "executed": executed,
@@ -353,11 +427,18 @@ def _dir_completion(obj, prefix=""):
 # Jedi-based operations
 # ---------------------------------------------------------------------------
 
-def _jedi_script(text):
-    """Wrap user text with the sage prelude and build a Jedi Script."""
+def _jedi_script(text, path=None):
+    """Wrap user text (preparsed to valid Python) with the sage prelude and
+    build a Jedi Script.
+
+    `path` is the document's real filesystem path: jedi uses its directory
+    for import resolution, so sibling modules (`import helper` sitting next
+    to the .sage file) resolve -- the old /tmp fallback hid them.
+    """
     if not JEDI_AVAILABLE:
         return None
-    return jedi.Script(PRELUDE + (text or ""), path="/tmp/__sage_hover.sage")
+    return jedi.Script(PRELUDE + _preparse(text),
+                       path=path or "/tmp/__sage_hover.sage")
 
 
 def _name_doc_and_sig(name_obj):
@@ -428,12 +509,12 @@ def op_lookup(name):
     return {"error": err or "not found", "doc": "", "source": ""}
 
 
-def op_hover(text, line, col):
+def op_hover(text, line, col, path=None):
     """Hover at 0-based (line, col) in user text."""
-    script = _jedi_script(text)
+    script = _jedi_script(text, path)
     if script is None:
         return {"empty": True}
-    jline = line + 1 + PRELUDE_LINES
+    jline, jcol = _mapped_jedi_position(text, line, col)
     # 1. Live namespace first (constructed objects + dotted attributes).
     word = _word_at(text, line, col)
     if word:
@@ -445,7 +526,7 @@ def op_hover(text, line, col):
                     "kind": type(recv).__name__, "source": src or "namespace"}
     # 2. Jedi infer.
     try:
-        names = script.infer(jline, col)
+        names = script.infer(jline, jcol)
     except Exception:
         names = []
     if names:
@@ -507,14 +588,14 @@ def _format_signature(name, result):
     return "%s(%s)" % (name, ", ".join(rendered))
 
 
-def op_signatures(text, line, col):
+def op_signatures(text, line, col, path=None):
     """Signature help at 0-based (line, col)."""
-    script = _jedi_script(text)
+    script = _jedi_script(text, path)
     sigs_out = []
     if script is not None:
-        jline = line + 1 + PRELUDE_LINES
+        jline, jcol = _mapped_jedi_position(text, line, col)
         try:
-            jsigs = script.get_signatures(jline, col)
+            jsigs = script.get_signatures(jline, jcol)
         except Exception:
             jsigs = []
         for s in jsigs[:1]:
@@ -580,14 +661,41 @@ def _callee_before(text, line, col):
     return ""
 
 
-def op_complete(text, line, col):
+def _jedi_completion_items(script, jline, jcol, seen, limit=500):
+    """Jedi completions at a position as item dicts, skipping labels already
+    in `seen` (runtime dir() items win -- they are the ground truth)."""
+    items = []
+    try:
+        comps = script.complete(jline, jcol)
+    except Exception:
+        return items
+    for c in comps:
+        if len(items) >= limit:
+            break
+        if c.name in seen:
+            continue
+        seen.add(c.name)
+        items.append({
+            "label": c.name, "kind": c.type, "detail": "",
+            "doc": (c.docstring(raw=True) or "")[:4000], "complete": c.complete,
+        })
+    return items
+
+
+def op_complete(text, line, col, path=None):
     """Completions at 0-based (line, col).
 
-    Priority: document namespace (live constructed objects) -> jedi ->
-    getattr-on-sage.all dir() fallback (for ZZ. etc. that jedi can't see).
+    Dotted receivers: MERGE the live namespace (runtime ground truth via
+    dir()) with jedi's static completions -- neither alone is complete. Jedi
+    cannot infer sage/numpy constructor return types (M., A. -> 0 items),
+    while dir() can miss type-level descriptors that raise at runtime.
+    Dedupe by label, namespace first. Non-dotted: jedi only (general
+    completion is handled TS-side).
     """
-    script = _jedi_script(text)
+    script = _jedi_script(text, path)
+    jline, jcol = _mapped_jedi_position(text, line, col)
     items = []
+    seen = set()
     # Determine the dotted receiver (e.g. "M." or "obj.par") from the line.
     line_text = (text or "").split("\n")[line] if text and line < len(text.split("\n")) else ""
     left = line_text[:col] if col <= len(line_text) else line_text
@@ -598,37 +706,18 @@ def op_complete(text, line, col):
         # 1. Live namespace (constructed objects: M = matrix(...))
         recv, src = _resolve_in_namespace(recv_name)
         if recv is not None:
-            items = _dir_completion(recv, prefix)
-            if items:
-                return {"items": items}
-        # 2. Jedi on the dotted position
+            for it in _dir_completion(recv, prefix):
+                if it["label"] not in seen:
+                    seen.add(it["label"])
+                    items.append(it)
+        # 2. Jedi on the dotted position (adds anything dir() missed)
         if script is not None:
-            jline = line + 1 + PRELUDE_LINES
-            try:
-                comps = script.complete(jline, col)
-            except Exception:
-                comps = []
-            for c in comps[:500]:
-                items.append({
-                    "label": c.name, "kind": c.type, "detail": "",
-                    "doc": (c.docstring(raw=True) or "")[:4000], "complete": c.complete,
-                })
-            if items:
-                return {"items": items}
-        # 3. (recv was None here) nothing more to try for an unresolvable recv.
-        return {"items": items}
+            items.extend(_jedi_completion_items(script, jline, jcol, seen,
+                                                limit=max(0, 500 - len(items))))
+        return {"items": items[:500]}
     # Non-dotted context: jedi only (general completion is handled TS-side).
     if script is not None:
-        jline = line + 1 + PRELUDE_LINES
-        try:
-            comps = script.complete(jline, col)
-        except Exception:
-            comps = []
-        for c in comps[:500]:
-            items.append({
-                "label": c.name, "kind": c.type, "detail": "",
-                "doc": (c.docstring(raw=True) or "")[:4000], "complete": c.complete,
-            })
+        items.extend(_jedi_completion_items(script, jline, jcol, seen))
     return {"items": items}
 
 
@@ -658,11 +747,14 @@ def main():
             if op == "lookup":
                 result = op_lookup(req.get("name", ""))
             elif op == "hover":
-                result = op_hover(req.get("text", ""), req.get("line", 0), req.get("col", 0))
+                result = op_hover(req.get("text", ""), req.get("line", 0),
+                                  req.get("col", 0), path=req.get("path"))
             elif op == "signatures":
-                result = op_signatures(req.get("text", ""), req.get("line", 0), req.get("col", 0))
+                result = op_signatures(req.get("text", ""), req.get("line", 0),
+                                       req.get("col", 0), path=req.get("path"))
             elif op == "complete":
-                result = op_complete(req.get("text", ""), req.get("line", 0), req.get("col", 0))
+                result = op_complete(req.get("text", ""), req.get("line", 0),
+                                     req.get("col", 0), path=req.get("path"))
             elif op == "sync_namespace":
                 result = sync_namespace(req.get("text", ""), enabled=bool(req.get("enabled", True)))
             else:

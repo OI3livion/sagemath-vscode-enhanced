@@ -1,4 +1,5 @@
 import * as path from 'path';
+import { fileURLToPath } from 'url';
 import {
 	createConnection,
 	TextDocuments,
@@ -405,6 +406,16 @@ connection.onDidChangeWatchedFiles(_change => {
 	connection.console.log('We received a file change event');
 });
 
+// The document's filesystem path (undefined for untitled/non-file buffers).
+// Passed to the sage daemon so jedi resolves imports of sibling modules.
+function docFsPath(document: TextDocument): string | undefined {
+	try {
+		return fileURLToPath(document.uri);
+	} catch {
+		return undefined;
+	}
+}
+
 // Helper function to get the word being typed at the cursor position
 function getWordAtPosition(document: TextDocument, position: { line: number; character: number }): string {
 	const line = document.getText({
@@ -522,7 +533,7 @@ connection.onCompletion(
 		const callCtx = getCallContextFromText(lineText);
 		if (callCtx) {
 			if (sageReady) {
-				const sigRes = await sageBackend.analyze('signatures', document.getText(), pos.line, pos.character, 5000);
+				const sigRes = await sageBackend.analyze('signatures', document.getText(), pos.line, pos.character, 5000, docFsPath(document));
 				if (sigRes && !sigRes.error && sigRes.signatures && sigRes.signatures.length > 0) {
 					const params = sigRes.signatures[0].params || [];
 					const used = findUsedKwargs(lineText);
@@ -548,7 +559,7 @@ connection.onCompletion(
 		// cannot infer the receiver type (e.g. cython singletons / constructors).
 		if (isDottedContext(lineText, currentWord)) {
 			if (sageReady) {
-				const res = await sageBackend.analyze('complete', document.getText(), pos.line, pos.character, 5000);
+				const res = await sageBackend.analyze('complete', document.getText(), pos.line, pos.character, 5000, docFsPath(document));
 				if (res && !res.error && res.items && res.items.length > 0) {
 					for (const it of res.items) {
 						const summary = it.doc ? rstToMarkdown(it.doc).split('\n').find(l => l.trim()) ?? '' : '';
@@ -635,7 +646,7 @@ connection.onCompletion(
 
 		// Jedi extras (e.g. MatrixSpace, NumberField variants, user imports).
 		if (sageReady) {
-			const res = await sageBackend.analyze('complete', document.getText(), pos.line, pos.character, 3000);
+			const res = await sageBackend.analyze('complete', document.getText(), pos.line, pos.character, 3000, docFsPath(document));
 			if (res && !res.error && res.items) {
 				for (const it of res.items) {
 					const key = it.label.toLowerCase();
@@ -735,7 +746,8 @@ connection.onHover(
 		//    name lookup, then to the bundled one-line docs.
 		let sageDoc: SymbolDoc | undefined;
 		const hoverResult = await sageBackend.analyze(
-			'hover', document.getText(), textDocumentPosition.position.line, textDocumentPosition.position.character
+			'hover', document.getText(), textDocumentPosition.position.line, textDocumentPosition.position.character,
+			15000, docFsPath(document)
 		);
 		if (hoverResult && !hoverResult.error && !hoverResult.empty) {
 			sageDoc = docFromHoverResult(hoverResult.name || word, hoverResult);
@@ -872,7 +884,8 @@ connection.onSignatureHelp(
 
 		// 1. Position-based jedi signatures (best -- resolves the actual call).
 		const sigResult = await sageBackend.analyze(
-			'signatures', document.getText(), params.position.line, params.position.character
+			'signatures', document.getText(), params.position.line, params.position.character,
+			15000, docFsPath(document)
 		);
 		if (sigResult && !sigResult.error && sigResult.signatures && sigResult.signatures.length > 0) {
 			const jsig = sigResult.signatures[0];
